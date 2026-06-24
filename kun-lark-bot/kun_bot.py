@@ -61,7 +61,7 @@ APP_SECRET = os.environ.get("LARK_APP_SECRET", "").strip()
 # --- Open-source AI ("Kun") endpoint ----------------------------------------
 # Defaults target a local Ollama install. Point these at wherever your AI runs.
 KUN_API_BASE = os.environ.get("KUN_API_BASE", "http://localhost:11434/v1").rstrip("/")
-KUN_MODEL = os.environ.get("KUN_MODEL", "llama3")
+KUN_MODEL = os.environ.get("KUN_MODEL", "qwen2.5")
 KUN_API_KEY = os.environ.get("KUN_API_KEY", "").strip()
 KUN_SYSTEM_PROMPT = os.environ.get(
     "KUN_SYSTEM_PROMPT", "You are Kun, a helpful assistant. Reply concisely."
