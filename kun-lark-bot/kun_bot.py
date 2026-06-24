@@ -61,7 +61,9 @@ APP_SECRET = os.environ.get("LARK_APP_SECRET", "").strip()
 # --- Open-source AI ("Kun") endpoint ----------------------------------------
 # Defaults target a local Ollama install. Point these at wherever your AI runs.
 KUN_API_BASE = os.environ.get("KUN_API_BASE", "http://localhost:11434/v1").rstrip("/")
-KUN_MODEL = os.environ.get("KUN_MODEL", "qwen2.5")
+# Leave KUN_MODEL empty to auto-detect whichever model is installed (preferring
+# a Qwen / "q"-prefixed one). Set it explicitly only if you want to pin a model.
+KUN_MODEL = os.environ.get("KUN_MODEL", "").strip()
 KUN_API_KEY = os.environ.get("KUN_API_KEY", "").strip()
 KUN_SYSTEM_PROMPT = os.environ.get(
     "KUN_SYSTEM_PROMPT", "You are Kun, a helpful assistant. Reply concisely."
@@ -71,6 +73,9 @@ KUN_TIMEOUT = float(os.environ.get("KUN_TIMEOUT", "120"))
 # Keep a short rolling history per chat so conversations have context.
 HISTORY_TURNS = int(os.environ.get("KUN_HISTORY_TURNS", "8"))
 _history = defaultdict(lambda: deque(maxlen=HISTORY_TURNS * 2))
+
+# Resolved model name is cached after the first lookup.
+_resolved_model = None
 
 # A REST client (used to reply to messages). The WS client only receives.
 _api_client = None
@@ -85,11 +90,55 @@ def get_api_client():
     return _api_client
 
 
+def list_available_models() -> list:
+    """Query the OpenAI-compatible /models endpoint for installed model ids."""
+    headers = {}
+    if KUN_API_KEY:
+        headers["Authorization"] = f"Bearer {KUN_API_KEY}"
+    request = urllib.request.Request(f"{KUN_API_BASE}/models", headers=headers)
+    with urllib.request.urlopen(request, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return [m.get("id", "") for m in data.get("data", []) if m.get("id")]
+
+
+def resolve_model() -> str:
+    """Return the model to use.
+
+    Honors KUN_MODEL if set; otherwise auto-detects the installed model so you
+    never have to touch config when the model is updated or renamed. Prefers a
+    Qwen / "q"-prefixed model when several are available.
+    """
+    global _resolved_model
+    if KUN_MODEL:
+        return KUN_MODEL
+    if _resolved_model:
+        return _resolved_model
+    try:
+        models = list_available_models()
+    except Exception as exc:  # noqa: BLE001
+        lark.logger.warning(f"could not auto-detect model: {exc}")
+        return ""
+    if not models:
+        return ""
+    preferred = next((m for m in models if m.lower().startswith("q")), None)
+    _resolved_model = preferred or models[0]
+    lark.logger.info(f"auto-detected model: {_resolved_model} (from {models})")
+    return _resolved_model
+
+
 # --------------------------------------------------------------------------- #
 # Open-source AI call (OpenAI-compatible /chat/completions)
 # --------------------------------------------------------------------------- #
 def call_kun(chat_id: str, prompt: str) -> str:
     """Send the prompt (plus recent history) to the AI and return its reply."""
+    model = resolve_model()
+    if not model:
+        return (
+            f"⚠️ 找不到可用的模型。請確認 AI 服務（{KUN_API_BASE}）已啟動且至少裝了"
+            "一個模型（Ollama 可用 `ollama list` 查看、`ollama pull qwen2.5` 下載），"
+            "或在 .env 設定 KUN_MODEL。"
+        )
+
     messages = []
     if KUN_SYSTEM_PROMPT:
         messages.append({"role": "system", "content": KUN_SYSTEM_PROMPT})
@@ -97,7 +146,7 @@ def call_kun(chat_id: str, prompt: str) -> str:
     messages.append({"role": "user", "content": prompt})
 
     payload = json.dumps(
-        {"model": KUN_MODEL, "messages": messages, "stream": False}
+        {"model": model, "messages": messages, "stream": False}
     ).encode("utf-8")
 
     headers = {"Content-Type": "application/json"}
@@ -154,13 +203,15 @@ def cmd_ping(_chat_id: str, _arg: str) -> str:
 
 def cmd_status(_chat_id: str, _arg: str) -> str:
     reachable = "✅ 可連線" if ai_endpoint_reachable() else "❌ 連不到"
+    model = resolve_model() or "(偵測不到)"
+    model_src = "手動指定" if KUN_MODEL else "自動偵測"
     return (
         "Kun status ✅\n"
         f"host: {socket.gethostname()}\n"
         f"os: {platform.system()} {platform.release()}\n"
         f"python: {platform.python_version()}\n"
         f"AI endpoint: {KUN_API_BASE} ({reachable})\n"
-        f"model: {KUN_MODEL}\n"
+        f"model: {model} ({model_src})\n"
         f"time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
@@ -270,7 +321,8 @@ def main() -> int:
     )
 
     print("Kun 啟動中 — 正在以長連線模式連到 Lark…")
-    print(f"AI 端點：{KUN_API_BASE}  模型：{KUN_MODEL}")
+    model = resolve_model() or "(啟動時偵測不到，會在第一次對話時再試)"
+    print(f"AI 端點：{KUN_API_BASE}  模型：{model}")
     print("連上後，在 Lark 對 Kun 傳 'ping' 測試連線，或直接打字跟它對話。")
     while True:
         try:
