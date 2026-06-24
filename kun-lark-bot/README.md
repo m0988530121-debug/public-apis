@@ -1,14 +1,18 @@
 # Kun — Lark 聊天機器人（跑在家裡的伺服器上）
 
 Kun 是一個用 [Lark / 飛書官方 SDK](https://github.com/larksuite/oapi-sdk-python)
-寫的聊天機器人。它用 **長連線（WebSocket）模式** 連到 Lark，所以：
+寫的聊天機器人，把你的 **開源 AI** 接到 Lark：你在 Lark 講的話會轉給 AI，
+再把 AI 的回答回覆給你。它用 **長連線（WebSocket）模式** 連到 Lark，所以：
 
 - ✅ 家裡的機器**不需要公開 IP**
 - ✅ **不需要 port forwarding / 內網穿透 / 反向代理**
 - ✅ **不需要對外開防火牆 port**
 
-Kun 主動撥號連到 Lark，Lark 再把你傳的訊息推下來。你只要在 Lark 對 Kun
-傳一句話，家裡那台機器就會收到並回覆 —— 這就是你要的「遠端測試是否接通」。
+Kun 主動撥號連到 Lark，Lark 再把你傳的訊息推下來。
+
+**支援哪些 AI？** 任何提供 **OpenAI 相容 `/chat/completions` 介面** 的開源
+AI 都能接，例如 **Ollama、LM Studio、vLLM、LocalAI、text-generation-webui**。
+你只要在 `.env` 設定 AI 的網址（`KUN_API_BASE`）與模型名（`KUN_MODEL`）即可。
 
 ---
 
@@ -41,9 +45,11 @@ cd kun-lark-bot
 # 1) 安裝依賴
 pip install -r requirements.txt
 
-# 2) 填入你的憑證
+# 2) 填入設定
 cp .env.example .env
-#   用編輯器打開 .env，填入 LARK_APP_ID 與 LARK_APP_SECRET
+#   用編輯器打開 .env：
+#     - 填入 LARK_APP_ID 與 LARK_APP_SECRET
+#     - 設定 KUN_API_BASE（你的開源 AI 網址）與 KUN_MODEL（模型名）
 
 # 3) 啟動 Kun
 set -a; source .env; set +a
@@ -60,12 +66,17 @@ python kun_bot.py
 
 | 你傳 | Kun 回覆 |
 |------|----------|
-| `ping` | `pong ✅` + 家裡機器的主機名稱與時間（**確認接通**）|
-| `status` | 家裡機器的 OS / Python / 時間 |
-| `echo 哈囉` | `哈囉` |
+| `ping` | `pong ✅` + 家裡機器主機名稱與時間（**先確認 Lark 連線**）|
+| `status` | 主機狀態 **＋ AI 端點是否可連線** |
+| `reset` | 清除這個對話的上下文記憶 |
 | `help` | 指令清單 |
+| **其他任何文字** | **轉給開源 AI，回覆 AI 的回答**（這就是你要的「能對話回應」）|
 
-只要 `ping` 有收到 `pong ✅` 回覆，就表示 **Lark → 家裡的機器** 整條連線成功。
+驗證順序建議：
+1. 先傳 `ping` → 收到 `pong ✅` 代表 **Lark → 家裡機器** 連線 OK。
+2. 再傳 `status` → 看 `AI endpoint ... ✅ 可連線` 代表 AI 服務也接上了。
+3. 直接打一句話（例如「你好，自我介紹一下」）→ 收到 AI 的回答，代表
+   **整條「Lark 對話 → Kun(AI) 回應」已成功運作**。
 
 ---
 
@@ -99,19 +110,23 @@ journalctl -u kun -f          # 看即時日誌
 
 ---
 
-## 五、擴充：讓 Kun 在家裡做事
+## 五、調整 AI 行為 / 擴充指令
 
-打開 `kun_bot.py`，在 `COMMANDS` 字典裡加你自己的指令。例如新增一個
-回報磁碟空間的指令：
+- **換模型 / 換 AI**：改 `.env` 的 `KUN_MODEL` 與 `KUN_API_BASE` 即可，不用改程式。
+- **調整人設**：改 `.env` 的 `KUN_SYSTEM_PROMPT`。
+- **記憶長度**：改 `KUN_HISTORY_TURNS`（每個對話保留的來回輪數）。
+
+要新增「指令型」功能，打開 `kun_bot.py`，在 `COMMANDS` 字典裡加。處理函式的
+簽名是 `def handler(chat_id, arg) -> str`。例如回報磁碟空間：
 
 ```python
-def cmd_disk(_arg):
+def cmd_disk(_chat_id, _arg):
     import shutil
-    total, used, free = shutil.disk_usage("/")
+    total, _used, free = shutil.disk_usage("/")
     return f"磁碟剩餘 {free // (2**30)} GB / 共 {total // (2**30)} GB"
 
 COMMANDS["disk"] = (cmd_disk, "回報磁碟剩餘空間")
 ```
 
 ⚠️ **安全提醒**：不要在沒有嚴格白名單的情況下加入「任意 shell 指令執行」，
-因為任何能傳訊息給 Kun 的人都能觸發它。預設只提供安全的唯讀指令。
+因為任何能傳訊息給 Kun 的人都能觸發它。

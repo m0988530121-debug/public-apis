@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Kun — a Lark (Feishu) chatbot that runs on your home server.
+Kun — a Lark (Feishu) chatbot bridged to an open-source AI, running on your
+home server.
 
 It uses Lark's long-connection (WebSocket) mode, so the machine it runs on
 does NOT need a public IP, port forwarding, or any tunnel: Kun dials out to
 Lark and Lark pushes incoming messages down the connection.
 
-Send Kun a message in Lark to verify the connection works end to end:
-    ping            -> Kun replies "pong" with host + time   (connectivity test)
-    status          -> Kun replies with basic host status
-    echo <text>     -> Kun echoes <text> back
-    help            -> Kun lists the commands it understands
+When you message it in Lark, Kun forwards your text to your open-source AI
+(via an OpenAI-compatible /chat/completions endpoint — Ollama, vLLM, LocalAI,
+LM Studio, text-generation-webui, etc.) and replies with the AI's answer.
 
-Credentials are read from environment variables (see .env.example):
-    LARK_APP_ID, LARK_APP_SECRET
+A few built-in commands work without the AI, so you can test connectivity
+before the model is wired up:
+    ping            -> "pong" with host + time          (Lark connectivity test)
+    status          -> host status + whether the AI endpoint is reachable
+    reset           -> clear the conversation history for this chat
+    help            -> list commands
+Anything else you type is sent to the AI as a conversation.
+
+Configuration via environment variables (see .env.example):
+    LARK_APP_ID, LARK_APP_SECRET          (required, your Lark app)
+    KUN_API_BASE                          (open-source AI base URL)
+    KUN_MODEL                             (model name to use)
+    KUN_API_KEY                           (optional; many local servers ignore it)
+    KUN_SYSTEM_PROMPT                     (optional; persona / instructions)
 """
 
 import json
@@ -23,13 +34,14 @@ import platform
 import socket
 import sys
 import time
+import urllib.error
+import urllib.request
+from collections import defaultdict, deque
 from datetime import datetime
 
 try:
     import lark_oapi as lark
     from lark_oapi.api.im.v1 import (
-        CreateMessageRequest,
-        CreateMessageRequestBody,
         P2ImMessageReceiveV1,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
@@ -42,10 +54,25 @@ except ImportError:
     raise
 
 
+# --- Lark credentials -------------------------------------------------------
 APP_ID = os.environ.get("LARK_APP_ID", "").strip()
 APP_SECRET = os.environ.get("LARK_APP_SECRET", "").strip()
 
-# A REST client (used to send / reply messages). The WS client only receives.
+# --- Open-source AI ("Kun") endpoint ----------------------------------------
+# Defaults target a local Ollama install. Point these at wherever your AI runs.
+KUN_API_BASE = os.environ.get("KUN_API_BASE", "http://localhost:11434/v1").rstrip("/")
+KUN_MODEL = os.environ.get("KUN_MODEL", "llama3")
+KUN_API_KEY = os.environ.get("KUN_API_KEY", "").strip()
+KUN_SYSTEM_PROMPT = os.environ.get(
+    "KUN_SYSTEM_PROMPT", "You are Kun, a helpful assistant. Reply concisely."
+).strip()
+KUN_TIMEOUT = float(os.environ.get("KUN_TIMEOUT", "120"))
+
+# Keep a short rolling history per chat so conversations have context.
+HISTORY_TURNS = int(os.environ.get("KUN_HISTORY_TURNS", "8"))
+_history = defaultdict(lambda: deque(maxlen=HISTORY_TURNS * 2))
+
+# A REST client (used to reply to messages). The WS client only receives.
 _api_client = None
 
 
@@ -53,84 +80,139 @@ def get_api_client():
     global _api_client
     if _api_client is None:
         _api_client = (
-            lark.Client.builder()
-            .app_id(APP_ID)
-            .app_secret(APP_SECRET)
-            .build()
+            lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
         )
     return _api_client
 
 
 # --------------------------------------------------------------------------- #
-# Command handlers
-#
-# Add your own "home" actions here. Each handler receives the raw user text
-# (already stripped of the leading command word) and returns a string reply.
-# Keep handlers safe — do NOT add arbitrary shell execution unless you fully
-# trust everyone who can message this bot.
+# Open-source AI call (OpenAI-compatible /chat/completions)
 # --------------------------------------------------------------------------- #
-def cmd_ping(_arg: str) -> str:
+def call_kun(chat_id: str, prompt: str) -> str:
+    """Send the prompt (plus recent history) to the AI and return its reply."""
+    messages = []
+    if KUN_SYSTEM_PROMPT:
+        messages.append({"role": "system", "content": KUN_SYSTEM_PROMPT})
+    messages.extend(_history[chat_id])
+    messages.append({"role": "user", "content": prompt})
+
+    payload = json.dumps(
+        {"model": KUN_MODEL, "messages": messages, "stream": False}
+    ).encode("utf-8")
+
+    headers = {"Content-Type": "application/json"}
+    if KUN_API_KEY:
+        headers["Authorization"] = f"Bearer {KUN_API_KEY}"
+
+    request = urllib.request.Request(
+        f"{KUN_API_BASE}/chat/completions", data=payload, headers=headers
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=KUN_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        return f"⚠️ AI 回應錯誤 (HTTP {exc.code})：{detail}"
+    except urllib.error.URLError as exc:
+        return (
+            f"⚠️ 連不到 Kun AI（{KUN_API_BASE}）：{exc.reason}\n"
+            "請確認 AI 服務已啟動，且 KUN_API_BASE 設定正確。"
+        )
+    except Exception as exc:  # noqa: BLE001 - keep the bot alive
+        return f"⚠️ 呼叫 AI 時發生未預期錯誤：{exc}"
+
+    try:
+        answer = data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError):
+        return f"⚠️ AI 回傳格式無法解析：{json.dumps(data)[:300]}"
+
+    # Remember this turn so follow-up messages keep context.
+    _history[chat_id].append({"role": "user", "content": prompt})
+    _history[chat_id].append({"role": "assistant", "content": answer})
+    return answer or "（AI 回了空白內容）"
+
+
+def ai_endpoint_reachable() -> bool:
+    """Best-effort check that the AI base URL is at least listening."""
+    try:
+        urllib.request.urlopen(KUN_API_BASE, timeout=5)
+        return True
+    except urllib.error.HTTPError:
+        return True  # responded (even if 404) -> server is up
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# Built-in commands (work without the AI, for connectivity testing)
+# --------------------------------------------------------------------------- #
+def cmd_ping(_chat_id: str, _arg: str) -> str:
     host = socket.gethostname()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return f"pong ✅\nhost: {host}\ntime: {now}\nKun is alive and connected."
 
 
-def cmd_status(_arg: str) -> str:
-    host = socket.gethostname()
+def cmd_status(_chat_id: str, _arg: str) -> str:
+    reachable = "✅ 可連線" if ai_endpoint_reachable() else "❌ 連不到"
     return (
         "Kun status ✅\n"
-        f"host: {host}\n"
+        f"host: {socket.gethostname()}\n"
         f"os: {platform.system()} {platform.release()}\n"
         f"python: {platform.python_version()}\n"
+        f"AI endpoint: {KUN_API_BASE} ({reachable})\n"
+        f"model: {KUN_MODEL}\n"
         f"time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
 
-def cmd_echo(arg: str) -> str:
-    return arg if arg else "(nothing to echo)"
+def cmd_reset(chat_id: str, _arg: str) -> str:
+    _history.pop(chat_id, None)
+    return "已清除這個對話的記憶。🧹"
 
 
-def cmd_help(_arg: str) -> str:
+def cmd_help(_chat_id: str, _arg: str) -> str:
     lines = ["Kun 指令清單："]
     lines += [f"  {name} — {desc}" for name, (_, desc) in COMMANDS.items()]
+    lines.append("  其他任何文字 — 直接與 Kun(AI) 對話")
     return "\n".join(lines)
 
 
 # name -> (handler, description)
 COMMANDS = {
-    "ping": (cmd_ping, "測試連線，回覆 pong + 主機與時間"),
-    "status": (cmd_status, "回報這台家裡機器的基本狀態"),
-    "echo": (cmd_echo, "把你輸入的文字原樣回覆"),
+    "ping": (cmd_ping, "測試 Lark 連線，回覆 pong + 主機與時間"),
+    "status": (cmd_status, "回報主機狀態與 AI 端點是否可連線"),
+    "reset": (cmd_reset, "清除這個對話的上下文記憶"),
     "help": (cmd_help, "列出所有可用指令"),
 }
 
 
-def handle_text(text: str) -> str:
-    """Route a plain-text message to a command handler."""
+def route(chat_id: str, text: str) -> str:
+    """Built-in command if it matches one; otherwise talk to the AI."""
     text = (text or "").strip()
     if not text:
-        return "（空訊息）輸入 help 看可用指令。"
+        return "（空訊息）輸入 help 看可用指令，或直接打字跟我聊天。"
 
-    parts = text.split(maxsplit=1)
-    cmd = parts[0].lower()
-    arg = parts[1] if len(parts) > 1 else ""
+    cmd = text.split(maxsplit=1)[0].lower()
+    handler = COMMANDS.get(cmd, (None, None))[0]
+    if handler is not None:
+        arg = text[len(cmd):].strip()
+        return handler(chat_id, arg)
 
-    handler, _desc = COMMANDS.get(cmd, (None, None))
-    if handler is None:
-        return f"不認識的指令：{cmd}\n輸入 help 看可用指令。"
-    return handler(arg)
+    return call_kun(chat_id, text)
 
 
+# --------------------------------------------------------------------------- #
+# Lark plumbing
+# --------------------------------------------------------------------------- #
 def extract_text(message) -> str:
-    """Pull the plain text out of a Lark message event payload."""
     if getattr(message, "message_type", None) != "text":
         return ""
     try:
         content = json.loads(message.content or "{}")
     except (TypeError, ValueError):
         return ""
-    # Lark text content looks like {"text": "hello"}; strip any @mentions.
     raw = content.get("text", "")
+    # Strip @mentions so group chats work cleanly.
     return " ".join(p for p in raw.split() if not p.startswith("@")).strip()
 
 
@@ -157,10 +239,11 @@ def reply_to_message(message_id: str, text: str) -> None:
 
 def on_message_receive(data: P2ImMessageReceiveV1) -> None:
     message = data.event.message
+    chat_id = getattr(message, "chat_id", "") or "default"
     text = extract_text(message)
-    lark.logger.info(f"received: {text!r} (msg_id={message.message_id})")
+    lark.logger.info(f"received: {text!r} (chat={chat_id} msg={message.message_id})")
 
-    reply = handle_text(text)
+    reply = route(chat_id, text)
     reply_to_message(message.message_id, reply)
 
 
@@ -183,21 +266,19 @@ def main() -> int:
 
     handler = build_event_handler()
     ws_client = lark.ws.Client(
-        APP_ID,
-        APP_SECRET,
-        event_handler=handler,
-        log_level=lark.LogLevel.INFO,
+        APP_ID, APP_SECRET, event_handler=handler, log_level=lark.LogLevel.INFO
     )
 
     print("Kun 啟動中 — 正在以長連線模式連到 Lark…")
-    print("連上後，在 Lark 對 Kun 傳 'ping' 即可遠端測試是否接通。")
+    print(f"AI 端點：{KUN_API_BASE}  模型：{KUN_MODEL}")
+    print("連上後，在 Lark 對 Kun 傳 'ping' 測試連線，或直接打字跟它對話。")
     while True:
         try:
             ws_client.start()  # blocks; auto-reconnects internally
         except KeyboardInterrupt:
             print("\nKun 已停止。")
             return 0
-        except Exception as exc:  # keep the home server bot resilient
+        except Exception as exc:  # noqa: BLE001 - keep the home server bot alive
             lark.logger.error(f"connection error: {exc}; retrying in 5s")
             time.sleep(5)
 
