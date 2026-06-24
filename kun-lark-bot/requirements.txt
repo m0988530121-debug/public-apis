@@ -1,0 +1,3 @@
+# Kun Lark bot dependencies
+# Official Lark/Feishu open-platform SDK (includes the long-connection client).
+lark-oapi>=1.4.0
